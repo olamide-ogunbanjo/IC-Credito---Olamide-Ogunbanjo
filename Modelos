@@ -1,0 +1,473 @@
+# ==============================================================================
+# PIPELINE ECONOMÉTRICO – VERSÃO FINAL (SOMENTE MQO, SEM ARDL)
+# Projeto de Iniciação Científica - Olamide Ogunbanjo
+#
+# Especificações:
+#   Modelo 1 (principal): MQO dinâmico, ln(concessões reais) com o próprio
+#                         valor defasado em t-1 (ajustamento parcial)
+#   Modelo 1 (sensib.)  : MQO estático, série nominal, dummy ago/2021,
+#                         regressores contemporâneos e placebos
+#   Modelo 2            : MQO em primeiras diferenças (inadimplência)
+#
+# Como rodar:
+#   1) Salve o arquivo em UTF-8 e rode source("Pipeline_IC_Final.R", encoding = "UTF-8")
+#   2) Tudo que aparece no console é gravado em saidas_IC/log_console.txt
+#   3) Se um erro interromper a execução, rode sink() para fechar o log
+#   4) Para replicar sem baixar de novo (as séries do BCB podem ser revisadas),
+#      mude BAIXAR_DADOS para FALSE: o script usa saidas_IC/dados_brutos.rds
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0) CONFIGURAÇÃO E REPRODUTIBILIDADE
+# ------------------------------------------------------------------------------
+rm(list = ls())
+
+BAIXAR_DADOS <- TRUE
+DIR_SAIDA    <- "saidas_IC"
+DATA_INICIO  <- "2015-01-01"
+DATA_FIM     <- "2025-12-01"
+LAG_HAC      <- 7                       # defasagem do Newey-West (igual à versão anterior)
+
+dir.create(DIR_SAIDA, showWarnings = FALSE)
+sink(file.path(DIR_SAIDA, "log_console.txt"), split = TRUE)
+
+pacotes <- c("GetBCBData", "dplyr", "lubridate", "tseries", "urca", "lmtest",
+             "sandwich", "car", "vars", "seasonal", "modelsummary")
+faltando <- setdiff(pacotes, rownames(installed.packages()))
+if (length(faltando) > 0) {
+  sink()
+  stop("Instale os pacotes: ", paste(faltando, collapse = ", "))
+}
+invisible(lapply(pacotes, library, character.only = TRUE))
+
+secao <- function(txt) cat("\n", strrep("=", 78), "\n", txt, "\n", strrep("=", 78), "\n", sep = "")
+
+hac_vcov <- function(x) NeweyWest(x, lag = LAG_HAC, prewhite = FALSE)
+
+secao("0) INFORMAÇÕES DA EXECUÇÃO")
+cat("Data/hora:", format(Sys.time()), "\n")
+cat(R.version.string, "\n")
+cat("LAG_HAC =", LAG_HAC, "| BAIXAR_DADOS =", BAIXAR_DADOS, "\n")
+
+# ------------------------------------------------------------------------------
+# 1) EXTRAÇÃO DAS SÉRIES (BACEN / SGS)
+# ------------------------------------------------------------------------------
+secao("1) EXTRAÇÃO DAS SÉRIES")
+if (BAIXAR_DADOS) {
+  baixar <- function(id, fim = DATA_FIM) {
+    gbcbd_get_series(id, first.date = DATA_INICIO, last.date = fim)
+  }
+  brutos <- list(
+    conc  = baixar(24439),                       # Concessões totais dessazonalizadas (fluxo)
+    ipca  = baixar(433),                         # IPCA mensal (%)
+    selic = baixar(432, fim = "2025-12-31"),     # Selic meta diária (até o fim de dez/2025)
+    ibc   = baixar(24364),                       # IBC-Br dessazonalizado
+    inad  = baixar(21082),                       # Inadimplência (série original)
+    baixado_em = Sys.time()
+  )
+  saveRDS(brutos, file.path(DIR_SAIDA, "dados_brutos.rds"))
+} else {
+  brutos <- readRDS(file.path(DIR_SAIDA, "dados_brutos.rds"))
+}
+cat("Séries baixadas em:", format(brutos$baixado_em), "\n")
+
+# ------------------------------------------------------------------------------
+# 2) TRATAMENTO E CONSTRUÇÃO DAS VARIÁVEIS
+# ------------------------------------------------------------------------------
+secao("2) TRATAMENTO DOS DADOS")
+
+# 2.1 Dessazonalização da inadimplência (X-13ARIMA-SEATS, especificação padrão)
+inad <- brutos$inad %>%
+  mutate(ano_mes = floor_date(ref.date, "month")) %>%
+  arrange(ano_mes)
+
+inad_ts   <- ts(inad$value, start = c(2015, 1), frequency = 12)
+inad_seas <- seas(inad_ts)
+print(summary(inad_seas))
+
+inad <- inad %>%
+  mutate(inadimplencia = as.numeric(final(inad_seas))) %>%
+  dplyr::select(ano_mes, inadimplencia)
+
+# 2.2 Selic: média mensal da meta diária
+selic_mensal <- brutos$selic %>%
+  mutate(ano_mes = floor_date(ref.date, "month")) %>%
+  group_by(ano_mes) %>%
+  summarise(juros = mean(value, na.rm = TRUE), .groups = "drop")
+
+# 2.3 IBC-Br
+ibc_df <- brutos$ibc %>%
+  mutate(ano_mes = floor_date(ref.date, "month")) %>%
+  dplyr::select(ano_mes, atividade = value)
+
+# 2.4 Crédito nominal (24439) e real (deflacionado pelo IPCA; base = jan/2015 = 100)
+df_credito <- brutos$conc %>%
+  mutate(ano_mes = floor_date(ref.date, "month")) %>%
+  dplyr::select(ano_mes, credito_nom = value) %>%
+  left_join(
+    brutos$ipca %>%
+      mutate(ano_mes = floor_date(ref.date, "month")) %>%
+      dplyr::select(ano_mes, ipca = value),
+    by = "ano_mes"
+  ) %>%
+  arrange(ano_mes) %>%
+  mutate(
+    fator_deflator  = cumprod(1 + ipca / 100),
+    credito_real    = (credito_nom / fator_deflator) * 100,
+    ln_credito_nom  = log(credito_nom),
+    ln_credito_real = log(credito_real)
+  )
+
+# 2.5 Base consolidada, dummies, diferenças e defasagens
+df <- df_credito %>%
+  dplyr::select(ano_mes, ln_credito_nom, ln_credito_real) %>%
+  left_join(selic_mensal, by = "ano_mes") %>%
+  left_join(ibc_df,       by = "ano_mes") %>%
+  left_join(inad,         by = "ano_mes") %>%
+  arrange(ano_mes) %>%
+  mutate(
+    # Dummies
+    tecnologia = as.numeric(ano_mes >= as.Date("2021-02-01")),   # marco: início da fase 1 (fev/2021)
+    tec_ago21  = as.numeric(ano_mes >= as.Date("2021-08-01")),   # início do compartilhamento de dados de clientes
+    covid      = as.numeric(ano_mes >= as.Date("2020-03-01") & ano_mes <= as.Date("2021-12-01")),
+    # Primeiras diferenças
+    d_inadimplencia = inadimplencia   - dplyr::lag(inadimplencia, 1),
+    d_ln_cred_nom   = ln_credito_nom  - dplyr::lag(ln_credito_nom, 1),
+    d_ln_cred_real  = ln_credito_real - dplyr::lag(ln_credito_real, 1),
+    d_juros         = juros           - dplyr::lag(juros, 1),
+    d_atividade     = atividade       - dplyr::lag(atividade, 1),
+    # Defasagens (Modelo 1)
+    ln_cred_lag       = dplyr::lag(ln_credito_real, 1),
+    ln_cred_nom_lag   = dplyr::lag(ln_credito_nom, 1),
+    inadimplencia_lag = dplyr::lag(inadimplencia, 1),
+    juros_lag3        = dplyr::lag(juros, 3),
+    atividade_lag2    = dplyr::lag(atividade, 2)
+  )
+
+# 2.6 Checagens de integridade (o script para se algo estiver errado)
+vars_basicas <- c("ln_credito_nom", "ln_credito_real", "juros", "atividade", "inadimplencia")
+stopifnot(
+  nrow(df) == 132,
+  sum(is.na(as.matrix(df[, vars_basicas]))) == 0,
+  all(df$ano_mes == seq(as.Date("2015-01-01"), by = "month", length.out = nrow(df)))
+)
+cat("Base completa: ", nrow(df), "meses (",
+    format(min(df$ano_mes)), "a", format(max(df$ano_mes)), ")\n")
+cat("Meses com tecnologia = 1 (fev/2021):", sum(df$tecnologia),
+    "| tec_ago21 = 1:", sum(df$tec_ago21), "| covid = 1:", sum(df$covid), "\n")
+
+# 2.7 Amostras de estimação (definidas uma única vez, para comparabilidade)
+vars_m1 <- c("ln_credito_real", "ln_credito_nom", "ln_cred_lag", "ln_cred_nom_lag",
+             "tecnologia", "tec_ago21", "juros", "atividade", "inadimplencia",
+             "juros_lag3", "atividade_lag2", "inadimplencia_lag", "covid")
+vars_m2 <- c("d_inadimplencia", "tecnologia", "tec_ago21", "d_ln_cred_real",
+             "d_ln_cred_nom", "d_juros", "d_atividade", "covid")
+
+df_m1 <- df %>% filter(if_all(all_of(vars_m1), ~ !is.na(.x)))
+df_m2 <- df %>% filter(if_all(all_of(vars_m2), ~ !is.na(.x)))
+cat("Amostra Modelo 1: N =", nrow(df_m1), "(", format(min(df_m1$ano_mes)), "a",
+    format(max(df_m1$ano_mes)), ")\n")
+cat("Amostra Modelo 2: N =", nrow(df_m2), "(", format(min(df_m2$ano_mes)), "a",
+    format(max(df_m2$ano_mes)), ")\n")
+stopifnot(nrow(df_m1) == 129, nrow(df_m2) == 131)
+
+write.csv(df, file.path(DIR_SAIDA, "base_final.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 3) ESTACIONARIEDADE (ADF, KPSS, ADF COM DEFASAGEM POR AIC, ZIVOT-ANDREWS)
+# ------------------------------------------------------------------------------
+secao("3) TESTES DE ESTACIONARIEDADE")
+
+testar_estacionariedade <- function(serie, nome) {
+  s_clean <- na.omit(serie)
+  adf  <- adf.test(s_clean)
+  kpss <- ur.kpss(s_clean, type = "tau")
+  cat("\n===", nome, "===\n")
+  cat("ADF  - Estatística:", round(adf$statistic, 3), "| p-valor:", round(adf$p.value, 4), "\n")
+  cat("KPSS - Estatística:", round(kpss@teststat, 3), "| Crítico (5%):", round(kpss@cval[2], 3), "\n")
+}
+
+cat("\n--- Em nível (série real) ---\n")
+series_nivel <- list("Ln(Crédito Real)" = df$ln_credito_real, "Juros" = df$juros,
+                     "Atividade" = df$atividade, "Inadimplência" = df$inadimplencia)
+invisible(mapply(testar_estacionariedade, series_nivel, names(series_nivel)))
+
+cat("\n--- Em primeira diferença ---\n")
+series_diff <- list("Δ Ln(Crédito Real)" = df$d_ln_cred_real, "Δ Juros" = df$d_juros,
+                    "Δ Atividade" = df$d_atividade, "Δ Inadimplência" = df$d_inadimplencia)
+invisible(mapply(testar_estacionariedade, series_diff, names(series_diff)))
+
+# ADF com defasagem escolhida por AIC (até 12 defasagens). Atenção: a versão anterior
+# usava o padrão do ur.df (lags = 1); aqui a seleção por AIC é de fato livre.
+ur_aic <- function(serie, nome, tipo) {
+  r <- ur.df(na.omit(serie), type = tipo, lags = 12, selectlags = "AIC")
+  tau  <- r@teststat[1]
+  crit <- r@cval[1, "5pct"]
+  cat(sprintf("%-22s tipo=%-5s defasagens(AIC)=%2d  tau=%7.3f  crítico 5%%=%6.2f  -> %s\n",
+              nome, tipo, r@lags, tau, crit,
+              ifelse(tau < crit, "rejeita raiz unitária", "NÃO rejeita raiz unitária")))
+}
+cat("\n--- ADF com defasagem por AIC ---\n")
+ur_aic(df$ln_credito_real,   "Ln(Crédito Real)",   "trend")
+ur_aic(df$juros,             "Juros",              "drift")
+ur_aic(df$atividade,         "Atividade",          "trend")
+ur_aic(df$inadimplencia,     "Inadimplência",      "drift")
+ur_aic(df$d_ln_cred_real,    "Δ Ln(Crédito Real)", "drift")
+ur_aic(df$d_juros,           "Δ Juros",            "drift")
+ur_aic(df$d_atividade,       "Δ Atividade",        "drift")
+ur_aic(df$d_inadimplencia,   "Δ Inadimplência",    "drift")
+
+cat("\n--- Zivot-Andrews (Juros) ---\n")
+print(summary(ur.za(na.omit(df$juros), model = "both", lag = 4)))
+
+# ------------------------------------------------------------------------------
+# 4) VAR, COINTEGRAÇÃO DE JOHANSEN E GRANGER (DIAGNÓSTICO DO SISTEMA)
+# ------------------------------------------------------------------------------
+secao("4) VAR, JOHANSEN E GRANGER")
+
+sistema_real <- df %>% dplyr::select(ln_credito_real, juros, atividade, inadimplencia) %>% na.omit()
+sistema_nom  <- df %>% dplyr::select(ln_credito_nom,  juros, atividade, inadimplencia) %>% na.omit()
+exogenas <- df %>%
+  filter(complete.cases(ln_credito_real, juros, atividade, inadimplencia)) %>%
+  dplyr::select(tecnologia, covid) %>% as.matrix()
+
+cat("\n--- VARselect (série real) ---\n")
+print(VARselect(sistema_real, lag.max = 12, type = "const")$selection)
+
+cat("\n--- Portmanteau (autocorrelação residual do VAR) ---\n")
+for (p in c(2, 3)) {
+  cat("\nVAR com p =", p, "\n")
+  print(serial.test(VAR(sistema_real, p = p, type = "const", exogen = exogenas),
+                    lags.pt = 12, type = "PT.asymptotic"))
+}
+
+cat("\n--- ARCH multivariado (VAR p = 7) ---\n")
+print(arch.test(VAR(sistema_real, p = 7, type = "both", exogen = exogenas),
+                lags.multi = 5, multivariate.only = TRUE))
+
+resumo_johansen <- function(obj, rotulo) {
+  tab <- data.frame(H0 = rownames(obj@cval), estat = as.numeric(obj@teststat),
+                    crit5 = obj@cval[, "5pct"], row.names = NULL)
+  tab <- tab[nrow(tab):1, ]                     # ordem: r = 0, r <= 1, ...
+  r <- 0
+  for (i in seq_len(nrow(tab))) { if (tab$estat[i] > tab$crit5[i]) r <- i else break }
+  cat("\n", rotulo, "-> posto de cointegração a 5%: r =", r, "\n")
+  print(tab, row.names = FALSE)
+}
+cat("\n--- Johansen (traço; ecdet = const) ---\n")
+resumo_johansen(ca.jo(sistema_real, type = "trace", ecdet = "const", K = 2, dumvar = exogenas), "Real,    K = 2")
+johansen_real <- ca.jo(sistema_real, type = "trace", ecdet = "const", K = 3, dumvar = exogenas)
+resumo_johansen(johansen_real, "Real,    K = 3")
+resumo_johansen(ca.jo(sistema_nom,  type = "trace", ecdet = "const", K = 3, dumvar = exogenas), "Nominal, K = 3")
+cat("\n(Resumo completo, real K = 3)\n"); print(summary(johansen_real))
+
+cat("\n--- Granger (7 defasagens; série real) ---\n")
+print(grangertest(ln_credito_real ~ inadimplencia, order = 7, data = sistema_real))
+print(grangertest(inadimplencia ~ ln_credito_real, order = 7, data = sistema_real))
+
+# ------------------------------------------------------------------------------
+# 5) MODELO 1 – CONCESSÃO DE CRÉDITO (MQO)
+#    Base: dinâmico (ln do crédito real em t-1 como regressor).
+#    As defasagens Selic t-3, IBC-Br t-2 e inadimplência t-1 são escolhas
+#    econômicas (transmissão monetária e simultaneidade); a versão com todos os
+#    regressores contemporâneos entra como sensibilidade.
+# ------------------------------------------------------------------------------
+secao("5) MODELO 1 – ESTIMAÇÃO")
+
+m1_din      <- lm(ln_credito_real ~ ln_cred_lag + tecnologia + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid, data = df_m1)
+m1_din_nom  <- lm(ln_credito_nom  ~ ln_cred_nom_lag + tecnologia + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid, data = df_m1)
+m1_din_ago  <- lm(ln_credito_real ~ ln_cred_lag + tec_ago21 + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid, data = df_m1)
+m1_din_t0   <- lm(ln_credito_real ~ ln_cred_lag + tecnologia + juros + atividade + inadimplencia + covid, data = df_m1)
+m1_est_real <- lm(ln_credito_real ~ tecnologia + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid, data = df_m1)
+m1_est_nom  <- lm(ln_credito_nom  ~ tecnologia + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid, data = df_m1)
+
+cat("\n--- M1 BASE (dinâmico, real) – erros-padrão HAC ---\n")
+print(lmtest::coeftest(m1_din, vcov. = hac_vcov(m1_din)))
+cat("R2 ajustado:", round(summary(m1_din)$adj.r.squared, 4), "| N =", nobs(m1_din), "\n")
+
+rho <- unname(coef(m1_din)["ln_cred_lag"])
+cat("\nρ (coef. de ln_cred_lag) =", round(rho, 4),
+    "| meia-vida (meses) =", round(log(0.5) / log(rho), 1), "\n")
+cat("\nEfeito de longo prazo da tecnologia = beta/(1 - rho) (método delta, HAC):\n")
+print(car::deltaMethod(m1_din, "tecnologia/(1-ln_cred_lag)", vcov. = hac_vcov(m1_din)))
+cat("\nTeste ρ = 1 (indicativo; a distribuição F não é padrão perto de raiz unitária):\n")
+print(car::linearHypothesis(m1_din, "ln_cred_lag = 1", vcov. = hac_vcov(m1_din)))
+
+cat("\n--- M1 ESTÁTICO (real) – HAC ---\n")
+print(lmtest::coeftest(m1_est_real, vcov. = hac_vcov(m1_est_real)))
+
+cat("\n--- Phillips-Ouliaris (apenas variáveis I(1); modelo estático) ---\n")
+po_mat <- function(y) df_m1 %>% dplyr::select(all_of(c(y, "juros_lag3", "atividade_lag2", "inadimplencia_lag"))) %>% as.matrix()
+cat("Real:\n");    print(po.test(po_mat("ln_credito_real")))
+cat("Nominal:\n"); print(po.test(po_mat("ln_credito_nom")))
+
+# ------------------------------------------------------------------------------
+# 6) MODELO 2 – INADIMPLÊNCIA EM PRIMEIRAS DIFERENÇAS (MQO)
+#    A dummy em um modelo em diferenças mede mudança no ritmo médio mensal de
+#    variação da inadimplência (quebra de inclinação), e não deslocamento de nível.
+# ------------------------------------------------------------------------------
+secao("6) MODELO 2 – ESTIMAÇÃO")
+
+m2_real <- lm(d_inadimplencia ~ tecnologia + d_ln_cred_real + d_juros + d_atividade + covid, data = df_m2)
+m2_nom  <- lm(d_inadimplencia ~ tecnologia + d_ln_cred_nom  + d_juros + d_atividade + covid, data = df_m2)
+m2_ago  <- lm(d_inadimplencia ~ tec_ago21  + d_ln_cred_real + d_juros + d_atividade + covid, data = df_m2)
+
+cat("\n--- M2 BASE (diferenças, real) – HAC ---\n")
+print(lmtest::coeftest(m2_real, vcov. = hac_vcov(m2_real)))
+cat("R2 ajustado:", round(summary(m2_real)$adj.r.squared, 4), "| N =", nobs(m2_real), "\n")
+
+# ------------------------------------------------------------------------------
+# 7) ROBUSTEZ: PLACEBOS, SENSIBILIDADE DO HAC E DEFASAGENS
+# ------------------------------------------------------------------------------
+secao("7) ROBUSTEZ")
+
+# 7.1 Placebos: degrau falso estimado só na amostra anterior a fev/2021
+datas_placebo <- c("2017-01-01", "2018-07-01", "2019-01-01")
+rodar_placebos <- function(dados, formula_txt, rotulo) {
+  do.call(rbind, lapply(datas_placebo, function(d) {
+    dp <- dados %>%
+      filter(ano_mes < as.Date("2021-02-01")) %>%
+      mutate(placebo = as.numeric(ano_mes >= as.Date(d)))
+    m  <- lm(as.formula(formula_txt), data = dp)
+    ct <- lmtest::coeftest(m, vcov. = hac_vcov(m))
+    data.frame(Modelo = rotulo, Placebo_a_partir_de = d, Coef = ct["placebo", 1],
+               EP_HAC = ct["placebo", 2], p_HAC = ct["placebo", 4], N = nobs(m))
+  }))
+}
+placebos <- rbind(
+  rodar_placebos(df_m1, "ln_credito_real ~ ln_cred_lag + placebo + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid", "M1 dinâmico (base)"),
+  rodar_placebos(df_m1, "ln_credito_real ~ placebo + juros_lag3 + atividade_lag2 + inadimplencia_lag + covid", "M1 estático"),
+  rodar_placebos(df_m2, "d_inadimplencia ~ placebo + d_ln_cred_real + d_juros + d_atividade + covid", "M2 diferenças")
+)
+cat("\n--- Placebos (coeficiente do degrau falso; esperado: não significativo) ---\n")
+print(placebos, row.names = FALSE, digits = 4)
+write.csv(placebos, file.path(DIR_SAIDA, "placebos.csv"), row.names = FALSE)
+
+# 7.2 Sensibilidade do erro-padrão HAC ao número de defasagens
+sens_hac <- function(mod, termo, rotulo) {
+  esp <- list("3" = 3, "5" = 5, "7" = 7, "12" = 12, "automático" = NULL)
+  do.call(rbind, lapply(names(esp), function(nm) {
+    v  <- NeweyWest(mod, lag = esp[[nm]], prewhite = FALSE)
+    ct <- lmtest::coeftest(mod, vcov. = v)
+    data.frame(Modelo = rotulo, Lag_HAC = nm, EP = ct[termo, 2], p = ct[termo, 4])
+  }))
+}
+sens <- rbind(sens_hac(m1_din, "tecnologia", "M1 dinâmico (base)"),
+              sens_hac(m1_est_real, "tecnologia", "M1 estático"),
+              sens_hac(m2_real, "tecnologia", "M2 diferenças"))
+cat("\n--- Sensibilidade do HAC (coeficiente de Tecnologia) ---\n")
+print(sens, row.names = FALSE, digits = 4)
+write.csv(sens, file.path(DIR_SAIDA, "sensibilidade_hac.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 8) DIAGNÓSTICOS DOS RESÍDUOS
+# ------------------------------------------------------------------------------
+secao("8) DIAGNÓSTICOS")
+
+diag_modelo <- function(mod, rotulo) {
+  bg <- lmtest::bgtest(mod, order = 7)
+  bp <- lmtest::bptest(mod)
+  data.frame(Modelo = rotulo, N = nobs(mod), R2_aj = summary(mod)$adj.r.squared,
+             BG7_p = bg$p.value, BP_p = bp$p.value, VIF_max = max(car::vif(mod)))
+}
+diagnosticos <- rbind(
+  diag_modelo(m1_din,      "M1 dinâmico real (base)"),
+  diag_modelo(m1_din_nom,  "M1 dinâmico nominal"),
+  diag_modelo(m1_din_ago,  "M1 dinâmico real, dummy ago/21"),
+  diag_modelo(m1_din_t0,   "M1 dinâmico real, contemporâneo"),
+  diag_modelo(m1_est_real, "M1 estático real"),
+  diag_modelo(m1_est_nom,  "M1 estático nominal"),
+  diag_modelo(m2_real,     "M2 diferenças real (base)"),
+  diag_modelo(m2_ago,      "M2 diferenças, dummy ago/21")
+)
+print(diagnosticos, row.names = FALSE, digits = 4)
+write.csv(diagnosticos, file.path(DIR_SAIDA, "diagnosticos.csv"), row.names = FALSE)
+
+cat("\nVIF – M1 base:\n");  print(car::vif(m1_din))
+cat("\nVIF – M2 base:\n");  print(car::vif(m2_real))
+
+# ------------------------------------------------------------------------------
+# 9) TABELAS (ERROS-PADRÃO HAC NEWEY-WEST)
+# ------------------------------------------------------------------------------
+secao("9) TABELAS")
+
+rotulos_m1 <- c(
+  "(Intercept)"       = "Intercepto",
+  "ln_cred_lag"       = "ln(Crédito real) t-1",
+  "ln_cred_nom_lag"   = "ln(Crédito nominal) t-1",
+  "tecnologia"        = "Tecnologia (dummy fev/2021)",
+  "tec_ago21"         = "Tecnologia (dummy ago/2021)",
+  "juros_lag3"        = "Selic t-3",
+  "juros"             = "Selic t",
+  "atividade_lag2"    = "IBC-Br t-2",
+  "atividade"         = "IBC-Br t",
+  "inadimplencia_lag" = "Inadimplência t-1",
+  "inadimplencia"     = "Inadimplência t",
+  "covid"             = "Covid"
+)
+rotulos_m2 <- c(
+  "(Intercept)"    = "Intercepto",
+  "tecnologia"     = "Tecnologia (dummy fev/2021)",
+  "tec_ago21"      = "Tecnologia (dummy ago/2021)",
+  "d_ln_cred_real" = "Δ ln(Crédito real)",
+  "d_ln_cred_nom"  = "Δ ln(Crédito nominal)",
+  "d_juros"        = "Δ Selic",
+  "d_atividade"    = "Δ IBC-Br",
+  "covid"          = "Covid"
+)
+
+lista_t1 <- list("Dinâmico real (BASE)" = m1_din, "Dinâmico nominal" = m1_din_nom,
+                 "Dinâmico real, ago/21" = m1_din_ago, "Dinâmico real, contemp." = m1_din_t0,
+                 "Estático real" = m1_est_real, "Estático nominal" = m1_est_nom)
+lista_t2 <- list("Δ Inadimplência (BASE, real)" = m2_real, "Δ Inadimplência (nominal)" = m2_nom,
+                 "Δ Inadimplência (ago/21)" = m2_ago)
+
+gerar_tabela <- function(lista, rotulos, titulo, arq) {
+  args <- list(models = lista, vcov = hac_vcov, stars = TRUE, coef_map = rotulos,
+               gof_omit = "IC|Log|RMSE", title = titulo)
+  print(do.call(modelsummary, c(args, list(output = "markdown"))))
+  df_tab <- do.call(modelsummary, c(args, list(output = "data.frame")))
+  write.csv(df_tab, file.path(DIR_SAIDA, paste0(arq, ".csv")), row.names = FALSE)
+  tryCatch(do.call(modelsummary, c(args, list(output = file.path(DIR_SAIDA, paste0(arq, ".html"))))),
+           error = function(e) cat("Aviso: não foi possível gravar", arq, ".html:", conditionMessage(e), "\n"))
+}
+gerar_tabela(lista_t1, rotulos_m1, "Tabela 1: Modelo 1 – Concessão de crédito (MQO, EP HAC)", "tabela1_modelo1")
+gerar_tabela(lista_t2, rotulos_m2, "Tabela 2: Modelo 2 – Inadimplência em primeiras diferenças (MQO, EP HAC)", "tabela2_modelo2")
+
+# ------------------------------------------------------------------------------
+# 10) QUADRO DE CONFERÊNCIA: COEFICIENTE DE TECNOLOGIA EM TODAS AS ESPECIFICAÇÕES
+# ------------------------------------------------------------------------------
+secao("10) QUADRO DE CONFERÊNCIA")
+
+extrai <- function(mod, termo, rotulo, em_log) {
+  ct <- lmtest::coeftest(mod, vcov. = hac_vcov(mod))
+  b  <- ct[termo, 1]
+  data.frame(Especificacao = rotulo, Termo = termo, Coef = b, EP_HAC = ct[termo, 2],
+             p_HAC = ct[termo, 4], Efeito_pct = ifelse(em_log, (exp(b) - 1) * 100, NA),
+             N = nobs(mod), R2_aj = summary(mod)$adj.r.squared)
+}
+resumo <- rbind(
+  extrai(m1_din,      "tecnologia", "M1 dinâmico real (BASE)",       TRUE),
+  extrai(m1_din_nom,  "tecnologia", "M1 dinâmico nominal",           TRUE),
+  extrai(m1_din_ago,  "tec_ago21",  "M1 dinâmico real, ago/21",      TRUE),
+  extrai(m1_din_t0,   "tecnologia", "M1 dinâmico real, contemporâneo", TRUE),
+  extrai(m1_est_real, "tecnologia", "M1 estático real",              TRUE),
+  extrai(m1_est_nom,  "tecnologia", "M1 estático nominal",           TRUE),
+  extrai(m2_real,     "tecnologia", "M2 diferenças real (BASE)",     FALSE),
+  extrai(m2_nom,      "tecnologia", "M2 diferenças nominal",         FALSE),
+  extrai(m2_ago,      "tec_ago21",  "M2 diferenças, ago/21",         FALSE)
+)
+print(resumo, row.names = FALSE, digits = 4)
+write.csv(resumo, file.path(DIR_SAIDA, "resumo_coeficiente_tecnologia.csv"), row.names = FALSE)
+
+cat("\nValores de referência da rodada anterior (para conferir a replicação):\n")
+cat("  M1 estático nominal: +0,448 | estático real: +0,178 | dinâmico real: +0,0546\n")
+cat("  M1 dinâmico: BG7 p = 0,449 | ρ = 0,914 | N = 129\n")
+cat("  M2 diferenças real: +0,033 (EP 0,020) | N = 131\n")
+
+# ------------------------------------------------------------------------------
+# 11) ENCERRAMENTO
+# ------------------------------------------------------------------------------
+writeLines(capture.output(sessionInfo()), file.path(DIR_SAIDA, "sessionInfo.txt"))
+cat("\nArquivos gravados em:", normalizePath(DIR_SAIDA), "\n")
+sink()
